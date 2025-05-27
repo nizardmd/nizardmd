@@ -1,0 +1,254 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from pydmd import DMD
+from pydmd.bopdmd import BOPDMD
+import sys
+
+print("--- Démarrage de l'analyse : DMD classique vs BOPDMD (Appariement par fréquence) ---")
+
+# 1) Discrétisation
+nx = 400 # Nombre de points spatiaux
+nt = 200 # Nombre de points temporels
+
+xi = np.linspace(-10, 10, nx)      # grille spatiale
+t  = np.linspace(0, 4*np.pi, nt)   # grille temporelle
+dt = t[1] - t[0]
+
+
+# 2) Création des grilles pour les fonctions
+Xgrid, T_grid = np.meshgrid(xi, t)
+
+def sech(x):
+    return 1/np.cosh(x)
+
+# 3) Génération des signaux spatio-temporels (Vos fonctions d'origine, qui sont complexes)
+f1 = sech(Xgrid + 3) * np.exp(1j * 2.3 * T_grid)
+f2 = sech(Xgrid) * np.tanh(Xgrid) * 2 * np.exp(1j * 2.8 * T_grid)
+F  = f1 + f2  # F aura la forme (nt, nx) et est complexe
+
+# 4) Ajout de bruit gaussien
+bruit_amplitude = 0.2
+np.random.seed(42) # Pour la reproductibilité
+F_bruit = F + bruit_amplitude * np.max(np.abs(F)) * (
+    np.random.randn(*F.shape) + 1j * np.random.randn(*F.shape)
+)
+
+# 5) Préparation des Snapshots pour PyDMD
+# PyDMD s'attend à des instantanés de forme (features_spatiales, pas_de_temps) = (nx, nt)
+snapshots_complex = F_bruit.T
+snapshots_complex = np.array(snapshots_complex, dtype=np.complex128, copy=True)
+
+print(f"Forme des données d'entrée pour DMD: {snapshots_complex.shape} (complexe)")
+print(f"Type de données des snapshots: {snapshots_complex.dtype}")
+print(f"Snapshots C-contigu? {snapshots_complex.flags['C_CONTIGUOUS']}")
+
+# Vérification critique de la forme
+expected_shape = (nx, nt)
+if snapshots_complex.shape != expected_shape:
+    print(f"!!! ERREUR CRITIQUE: snapshots_complex a la forme {snapshots_complex.shape}, "
+          f"mais {expected_shape} est attendu par PyDMD. Arrêt du script. !!!", file=sys.stderr)
+    sys.exit(1)
+
+# 3) Matrice de données X (nx × nt)
+X = F_bruit.T                                   # snapshots en colonnes → (nx=400, nt=200)
+
+# 4) PCA via SVD
+U_pca, S_pca, Vh_pca = np.linalg.svd(X, full_matrices=False)
+pc1_space = U_pca[:,0];  pc2_space = U_pca[:,1]
+time_pc1  = Vh_pca.conj().T[:,0]; time_pc2 = Vh_pca.conj().T[:,1]
+# normalisation à unité max
+pc1_space /= np.max(np.abs(pc1_space))
+pc2_space /= np.max(np.abs(pc2_space))
+time_pc1  /= np.max(np.abs(time_pc1))
+time_pc2  /= np.max(np.abs(time_pc2))
+
+# 5) DMD (rank-2)
+X1, X2 = X[:,:-1], X[:,1:]
+U, S, Vh = np.linalg.svd(X1, full_matrices=False)
+r = 2
+Ur, Sr, Vr = U[:,:r], np.diag(S[:r]), Vh.conj().T[:,:r]
+Atilde     = Ur.conj().T @ X2 @ Vr @ np.linalg.inv(Sr)
+eigvals, W = np.linalg.eig(Atilde)
+Phi        = X2 @ Vr @ np.linalg.inv(Sr) @ W      # (nx×r)
+omega      = np.log(eigvals) / dt     
+print(omega)            # (r,)
+
+# 6) Réordonnancement pour associer ω1=2.3, ω2=2.8
+order = np.argsort(np.imag(omega))
+Phi   = Phi[:, order]
+omega = omega[order]
+
+# 7) Extraction des modes DMD
+dmd_space1 = np.real(Phi[:,0])
+dmd_space2 = np.real(Phi[:,1])
+# normalisation à unité max
+dmd_space1 /= np.max(np.abs(dmd_space1))
+dmd_space2 /= np.max(np.abs(dmd_space2))
+
+dmd_time1 = np.real(np.exp(omega[0]*t))
+dmd_time2 = np.real(np.exp(omega[1]*t))
+# normalisation à unité max
+dmd_time1 /= np.max(np.abs(dmd_time1))
+dmd_time2 /= np.max(np.abs(dmd_time2))
+
+
+# 6) Dynamic Mode Decomposition classique
+try:
+    dmd = DMD(svd_rank=2, exact=True, opt=True, tlsq_rank=2) # svd_rank=2 pour 2 modes
+    dmd.fit(snapshots_complex) # Passer la matrice complexe directement
+    print("Fit DMD classique terminé.")
+except ValueError as e:
+    print(f"Erreur lors du fit DMD classique: {e}", file=sys.stderr)
+    sys.exit(1)
+
+# 7) Bagging-OptDMD (BOP-DMD)
+try:
+    bop = BOPDMD(svd_rank=2, num_trials=1000) # svd_rank=2 pour 2 modes
+    bop.fit(snapshots_complex, t) # Passer la matrice complexe directement et le vecteur temps
+    print("Fit BOP-DMD terminé.")
+except ValueError as e:
+    print(f"Erreur lors du fit BOP-DMD: {e}", file=sys.stderr)
+    sys.exit(1)
+
+
+# --- Fonctions d'extraction et de normalisation des modes et dynamiques ---
+def get_mode_spatial_complex(dmd_obj, mode_idx):
+    """Extrait et normalise un mode spatial complexe (max(abs) = 1)."""
+    mode = dmd_obj.modes[:, mode_idx]
+    return mode / np.max(np.abs(mode))
+
+def get_mode_temporal_complex(dmd_obj, mode_idx, time_array):
+    """Extrait et normalise une dynamique temporelle complexe (max(abs) = 1)."""
+    dynamic_val = dmd_obj.amplitudes[mode_idx] * np.exp(dmd_obj.eigs[mode_idx] * time_array)
+    return dynamic_val / np.max(np.abs(dynamic_val))
+
+def find_best_mode_index(dmd_obj, target_freq, used_indices=None):
+    """
+    Trouve l'indice du mode le plus proche de target_freq.
+    Évite de réutiliser les indices déjà trouvés.
+    """
+    if used_indices is None:
+        used_indices = []
+
+    freqs = np.imag(dmd_obj.eigs)
+    
+    # Créer une liste de différences pour les modes non encore utilisés
+    diffs = []
+    available_indices = []
+    for i, freq in enumerate(freqs):
+        if i not in used_indices:
+            diffs.append(np.abs(freq - target_freq))
+            available_indices.append(i)
+
+    if not available_indices: # Aucun mode disponible
+        return -1 # Indice invalide
+
+    best_idx_in_available = np.argmin(diffs)
+    return available_indices[best_idx_in_available]
+
+# --- Appariement des modes pour DMD et BOPDMD ---
+target_freq1 = 2.3
+target_freq2 = 2.8
+
+# DMD Classique
+used_indices_dmd = []
+idx_mode1_dmd = find_best_mode_index(dmd, target_freq1, used_indices_dmd)
+if idx_mode1_dmd != -1: used_indices_dmd.append(idx_mode1_dmd)
+
+idx_mode2_dmd = find_best_mode_index(dmd, target_freq2, used_indices_dmd)
+# Fallback si le second mode n'est pas trouvé ou si svd_rank était 1
+if idx_mode2_dmd == -1 and dmd.modes.shape[1] > 1 and idx_mode1_dmd != -1:
+    # S'il y a plus d'un mode et que seul le premier a été trouvé, prenez l'autre
+    all_dmd_indices = list(range(dmd.modes.shape[1]))
+    remaining_dmd_indices = [i for i in all_dmd_indices if i not in used_indices_dmd]
+    if remaining_dmd_indices:
+        idx_mode2_dmd = remaining_dmd_indices[0] # Prendre le premier mode restant
+    else:
+        # Si aucun autre mode n'est disponible, dupliquer le premier ou gérer comme vous le souhaitez
+        idx_mode2_dmd = idx_mode1_dmd if idx_mode1_dmd != -1 else 0 # Fallback pour éviter IndexError
+
+print(f"\nDMD - Indice du Mode 1 (fréquence ~{target_freq1:.1f}Hz): {idx_mode1_dmd}")
+print(f"DMD - Indice du Mode 2 (fréquence ~{target_freq2:.1f}Hz): {idx_mode2_dmd}")
+
+# Assurez-vous que les indices sont valides avant d'extraire
+
+# BOP-DMD
+used_indices_bop = []
+idx_mode1_bop = find_best_mode_index(bop, target_freq1, used_indices_bop)
+if idx_mode1_bop != -1: used_indices_bop.append(idx_mode1_bop)
+
+idx_mode2_bop = find_best_mode_index(bop, target_freq2, used_indices_bop)
+if idx_mode2_bop == -1 and bop.modes.shape[1] > 1 and idx_mode1_bop != -1:
+    all_bop_indices = list(range(bop.modes.shape[1]))
+    remaining_bop_indices = [i for i in all_bop_indices if i not in used_indices_bop]
+    if remaining_bop_indices:
+        idx_mode2_bop = remaining_bop_indices[0]
+    else:
+        idx_mode2_bop = idx_mode1_bop if idx_mode1_bop != -1 else 0
+
+print(f"BOP-DMD - Indice du Mode 1 (fréquence ~{target_freq1:.1f}Hz): {idx_mode1_bop}")
+print(f"BOP-DMD - Indice du Mode 2 (fréquence ~{target_freq2:.1f}Hz): {idx_mode2_bop}")
+
+bop_space1 = get_mode_spatial_complex(bop, idx_mode1_bop) if idx_mode1_bop != -1 else np.zeros(nx, dtype=complex)
+bop_space2 = get_mode_spatial_complex(bop, idx_mode2_bop) if idx_mode2_bop != -1 else np.zeros(nx, dtype=complex)
+bop_time1 = get_mode_temporal_complex(bop, idx_mode1_bop, t) if idx_mode1_bop != -1 else np.zeros(nt, dtype=complex)
+bop_time2 = get_mode_temporal_complex(bop, idx_mode2_bop, t) if idx_mode2_bop != -1 else np.zeros(nt, dtype=complex)
+
+
+# 8) Vérités Analytiques (Vos fonctions complexes, normalisées)
+true_space1_complex = sech(xi + 3)
+true_space2_complex = 2 * sech(xi) * np.tanh(xi)
+
+true_space1 = true_space1_complex / np.max(np.abs(true_space1_complex))
+true_space2 = true_space2_complex / np.max(np.abs(true_space2_complex))
+
+true_time1_complex = np.exp(1j * target_freq1 * t)
+true_time2_complex = np.exp(1j * target_freq2 * t)
+
+true_time1 = true_time1_complex / np.max(np.abs(true_time1_complex))
+true_time2 = true_time2_complex / np.max(np.abs(true_time2_complex))
+
+
+# 9) Tracés comparatifs (Affichage de la partie réelle pour la visualisation)
+fig, axes = plt.subplots(2,2,figsize=(14,8))
+
+# Mode 1 temporel
+axes[0,0].plot(t, np.real(true_time1), 'k-', label=f'Vérité ({target_freq1}Hz)')
+axes[0,0].plot(t, np.real(dmd_time1), 'b--', label='DMD')
+axes[0,0].plot(t, np.real(bop_time1), 'g-.', label='BOP-DMD')
+axes[0,0].set_title(f'Mode 1 — Temporel (Partie Réelle de {target_freq1}Hz)')
+axes[0,0].set_ylim(-1.1,1.1)
+axes[0,0].legend()
+
+# Mode 2 temporel
+axes[0,1].plot(t, np.real(true_time2), 'k-', label=f'Vérité ({target_freq2}Hz)')
+axes[0,1].plot(t, np.real(dmd_time2), 'b--', label='DMD')
+axes[0,1].plot(t, np.real(bop_time2), 'g-.', label='BOP-DMD')
+axes[0,1].set_title(f'Mode 2 — Temporel (Partie Réelle de {target_freq2}Hz)')
+axes[0,1].set_ylim(-1.1,1.1)
+axes[0,1].legend()
+
+# Mode 1 spatial
+axes[1,0].plot(xi, np.real(true_space1), 'k-', label=f'Vérité ({target_freq1}Hz)')
+axes[1,0].plot(xi, np.real(dmd_space1), 'b--', label='DMD')
+axes[1,0].plot(xi, np.real(bop_space1), 'g-.', label='BOP-DMD')
+axes[1,0].set_title(f'Mode 1 — Spatial (Partie Réelle de {target_freq1}Hz)')
+axes[1,0].set_ylim(-1.1,1.1)
+axes[1,0].legend()
+
+# Mode 2 spatial
+axes[1,1].plot(xi, np.real(true_space2), 'k-', label=f'Vérité ({target_freq2}Hz)')
+axes[1,1].plot(xi, np.real(-dmd_space2), 'b--', label='DMD')
+axes[1,1].plot(xi, np.real(bop_space2), 'g-.', label='BOP-DMD')
+axes[1,1].set_title(f'Mode 2 — Spatial (Partie Réelle de {target_freq2}Hz)')
+axes[1,1].set_ylim(-1.1,1.1)
+axes[1,1].legend()
+
+for ax in axes.flatten():
+    ax.set_xlabel('Position spatiale (x) / Temps (t)')
+    ax.set_ylabel('Amplitude (Partie Réelle)')
+    ax.grid(True)
+
+plt.tight_layout()
+plt.show()
+
