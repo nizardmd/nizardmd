@@ -1,0 +1,297 @@
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import datetime
+import os # Import the os module to create directories
+
+# 1) Vos secteurs à 10 tickers chacun
+SECTORS = {
+    'Tech':         ["AAPL","MSFT","NVDA","AMZN","GOOGL","META","AVGO","TSLA","INTC","ORCL"],
+    'Finance':      ["BRK-B","JPM","BAC","WFC","C","GS","MS","AXP","V","MA"],
+    'Consommation': ["PG","KO","MCD","PEP","WMT","COST","NKE","HD","SBUX","CL"]
+}
+
+# Create a directory to save plots if it doesn't exist
+output_dir = "plots"
+if not os.path.exists(output_dir):
+    os.makedirs(output_dir)
+
+
+def fetch_data(tickers):
+
+# Define the end date and compute the start date
+    end_date = "2025-05-09"   # M
+    start_date = "2023-05-09"   # 
+    # Download historical dataS
+    df = yf.download(
+        tickers, 
+        start=start_date, 
+        end=end_date, 
+        interval="1d", 
+        auto_adjust=True, 
+        progress=False
+    )["Close"]
+    return df.ffill().bfill()
+
+def DMD(X1, X2, r, dt):
+    U, S, Vh = np.linalg.svd(X1, full_matrices=False)
+    r = min(r, U.shape[1])
+    Ur = U[:, :r]
+    Sr = np.diag(S[:r])
+    Vr = Vh.conj().T[:, :r]
+    Atilde = Ur.T.conj() @ X2 @ Vr @ np.linalg.inv(Sr)
+    lam, W   = np.linalg.eig(Atilde)
+    Phi      = X2 @ Vr @ np.linalg.inv(Sr) @ W
+    lam = np.array(lam, dtype=complex)
+    omega    = np.log(lam) / dt
+    x1       = X1[:, 0]
+    b        = np.linalg.lstsq(Phi, x1, rcond=None)[0]
+    return Phi, omega, lam, b
+
+def success_rate(hist, tickers, m, ell, r_auto):
+    prices = hist[tickers].values
+    T, M = prices.shape
+    succ = tot = 0
+    for i in range(0, T - (m + ell)):
+        Xw = prices[i:i+m, :].T
+        X1, X2 = Xw[:,:-1], Xw[:,1:]
+        Phi, omega, lam, b = DMD(X1, X2, r_auto, dt=1.0)
+        pred   = (Phi * np.exp(omega*ell)).dot(b)
+        prev   = prices[i+m-1, :]
+        actual = prices[i+m-1+ell, :]
+        succ  += np.sum((pred>prev)==(actual>prev))
+        tot   += M
+    return succ/tot if tot>0 else 0
+
+def find_hotspot(hist, tickers, m_vals, ell_vals, r_auto):
+    best_rate = -1
+    best_m = best_ell = None
+    for m in m_vals:
+        for ell in ell_vals:
+            rate = success_rate(hist, tickers, m, ell, r_auto)
+            if rate > best_rate:
+                best_rate, best_m, best_ell = rate, m, ell
+    return best_m, best_ell,best_rate
+
+def _simulate_core(hist, tickers, m, ell, r_auto,
+                    allow_short, sliding, use_rsi,
+                    m_vals=None, ell_vals=None):
+    prices = hist[tickers].values
+    dates  = hist.index
+    T, M   = prices.shape
+    train_end = T - 100
+    capital = 1_000_000.0
+    cap_hist = [capital]
+    next_free = train_end
+    if use_rsi:
+        df = pd.DataFrame(prices, index=dates, columns=tickers)
+        delta = df.diff()
+        up   = delta.clip(lower=0)
+        down = -delta.clip(upper=0)
+        ema_up   = up.ewm(span=14, adjust=False).mean()
+        ema_down = down.ewm(span=14, adjust=False).mean()
+        rs    = ema_up/ema_down
+        rsi   = 100 - 100/(1+rs)
+        RSI_vals = rsi.values
+    for t in range(train_end, T-ell):
+        if t < next_free:
+            cap_hist.append(capital)
+            continue
+        if sliding:
+            hist_train = hist.iloc[t-100:t]
+            m, ell,rate = find_hotspot(hist_train, tickers, m_vals, ell_vals, r_auto)
+            if t+ell>=T:
+                cap_hist.append(capital)
+                continue
+
+        Xw = prices[t-m:t, :].T
+        X1, X2 = Xw[:,:-1], Xw[:,1:]
+        Phi, omega, lam, b = DMD(X1, X2, r_auto, dt=1.0)
+        prev = prices[t-1,:]
+        pred = (Phi * np.exp(omega*ell)).dot(b)
+        signal = np.where(pred>prev, 1, np.where(allow_short, -1, 0))
+        if use_rsi:
+            rsi_t = RSI_vals[t]
+            signal[(signal>0)&(rsi_t>70)] = 0
+            signal[(signal<0)&(rsi_t<30)] = 0
+        pos_size = capital / M
+        pnl = 0.0
+        for j in range(M):
+            if signal[j]==0: continue
+            buy   = prices[t,j]
+            sell = prices[t+ell,j]
+            ret   = (sell-buy)/buy * signal[j]
+            pnl += pos_size * ret 
+        capital += pnl
+        cap_hist.append(capital)
+        next_free = t + ell
+    arr = np.array(cap_hist[1:])
+    dates_out = dates[train_end : train_end + len(arr)]
+    return dates_out, arr
+
+def simulate_fixed(hist, tickers, m, ell, r_auto):
+    return _simulate_core(hist, tickers, m, ell, r_auto,
+                            allow_short=False, sliding=False, use_rsi=False)
+
+def simulate_sliding(hist, tickers, m, ell, r_auto, m_vals, ell_vals):
+    return _simulate_core(hist, tickers, m, ell, r_auto,
+                            allow_short=False, sliding=True, use_rsi=False,
+                            m_vals=m_vals, ell_vals=ell_vals)
+
+def simulate_longshort(hist, tickers, m, ell, r_auto):
+    return _simulate_core(hist, tickers, m, ell, r_auto,
+                            allow_short=True, sliding=False, use_rsi=False)
+
+def simulate_longshort_rsi(hist, tickers, m, ell, r_auto):
+    return _simulate_core(hist, tickers, m, ell, r_auto,
+                            allow_short=True, sliding=False, use_rsi=True)
+
+# ------- Script principal -------
+dt = 1.0
+m_range   = list(range(12,26))
+ell_range = list(range(1,11))
+
+
+    
+for sector, tickers in SECTORS.items():
+    hist = fetch_data(tickers)
+    hist_test = hist.iloc[-100:]   # 100 derniers jours
+
+    fig, axs = plt.subplots(5, 2, figsize=(12, 10), sharex=True)
+    fig.suptitle(f"{sector} – Évolution des prix (100 derniers jours)", fontsize=16)
+
+    for i, ticker in enumerate(tickers):
+        row, col = divmod(i, 2)
+        ax = axs[row][col]
+        ax.plot(hist_test.index, hist_test[ticker])
+        ax.set_title(ticker, fontsize=10)
+        ax.grid(True)
+
+    for ax in axs[-1]:
+        ax.set_xlabel("Date")
+    for row in axs:
+        for ax in row:
+            ax.set_ylabel("Prix ($)", fontsize=8)
+            ax.tick_params(axis='x', labelrotation=45)
+
+    plt.tight_layout(rect=[0, 0, 1, 0.97])
+    plt.savefig(os.path.join(output_dir, f"{sector}_price_evolution.png"))
+    plt.close(fig) 
+
+
+    # rang auto (95% énergie)
+    X_train = hist[tickers].values.T[:, :-1]
+    _, S, _ = np.linalg.svd(X_train, full_matrices=False)
+    cum = np.cumsum(S)/S.sum()
+    r_auto = np.searchsorted(cum, 0.95)+1
+    print(f"Rang DMD opti = {r_auto}")
+
+    # hotspot training
+    m_star, ell_star ,r = find_hotspot(hist, tickers, m_range, ell_range, r_auto)
+    print(f"Meilleur (m,ℓ)   = ({m_star},{ell_star},rate {r})")
+
+    # heatmap
+    grid = np.zeros((len(m_range), len(ell_range)))
+    for i,m in enumerate(m_range):
+        for j,ell in enumerate(ell_range):
+            grid[i,j] = success_rate(hist, tickers, m, ell, r_auto)
+    plt.figure(figsize=(6,5))
+    sns.heatmap(grid, xticklabels=ell_range, yticklabels=m_range, cmap="viridis")
+    plt.title(f"{sector} – Taux réussite (train 2 ans)")
+    plt.xlabel("ℓ"); plt.ylabel("m"); 
+    plt.savefig(os.path.join(output_dir, f"{sector}_success_rate_heatmap.png"))
+    plt.close() # Close the figure
+
+    # simulation des 4 algos
+    d1,c1 = simulate_fixed(hist, tickers, m_star, ell_star, r_auto)
+    d2,c2 = simulate_sliding(hist, tickers, m_star, ell_star, r_auto, m_range, ell_range)
+    d3,c3 = simulate_longshort(hist, tickers, m_star, ell_star, r_auto)
+    d4,c4 = simulate_longshort_rsi(hist, tickers, m_star, ell_star, r_auto)
+
+    # --- Ajout de la stratégie Buy & Hold ---
+    # identique date range que d1
+    start = len(hist) - 100
+    init_prices = hist[tickers].values[start]
+    capital0 = 1_000_000.0
+    shares = (capital0 / len(tickers)) / init_prices
+    # extraire les prix aux dates d1
+    idx     = hist.index.get_indexer(d1)
+    prices_bh = hist[tickers].values[idx]
+    cap_bh = (prices_bh * shares[None,:]).sum(axis=1)
+
+    # plot comparaison
+    plt.figure(figsize=(8,4))
+    plt.plot(d1, c1, label="Algo 1 fixe")
+    plt.plot(d2, c2, label="Algo 2 glissant")
+    plt.plot(d3, c3, label="Algo 3 long/short")
+    plt.plot(d4, c4, label="Algo 4 + RSI")
+    plt.plot(d1, cap_bh, '--k', label="Buy & Hold")
+    plt.title(f"{sector} – Évolution du capital (1 M$ init.)")
+    plt.xlabel("Date"); plt.ylabel("Capital ($)")
+    plt.legend(); plt.tight_layout(); 
+    plt.savefig(os.path.join(output_dir, f"{sector}_capital_evolution.png"))
+    plt.close() # Close the figure
+
+    import matplotlib.cm as cm
+    from pydmd.bopdmd import BOPDMD
+    X_recent = hist[tickers].iloc[-101:].values.T
+    time_vector_recent = np.arange(X_recent.shape[1]) * dt
+
+    try:
+        # Initialiser BOPDMD
+        bopdmd = BOPDMD(svd_rank=0, num_trials=1000)
+        
+        # Fitter BOPDMD avec les instantanés et le vecteur temps
+        bopdmd.fit(X_recent, time_vector_recent)
+
+        # Récupérer les résultats de BOPDMD
+        Phi_f = bopdmd.modes # Modes dynamiques (spatial)
+        lam_f = bopdmd.eigs # Valeurs propres agrégées
+        
+        r = Phi_f.shape[1] # Nombre réel de modes trouvés par BOPDMD
+        print(f"BOPDMD terminée. {r} modes trouvés.")
+
+    except Exception as e:
+        print(f"Erreur lors de l'ajustement de BOPDMD : {e}")
+        #exit() # Quitter le script en cas d'erreur
+        continue # Continue to the next sector if BOPDMD fails
+
+    # 3) Palette de couleurs
+    colors = cm.viridis(np.linspace(0, 1, r))
+
+    # 4) Graphe des valeurs propres (Eigenvalues)
+    plt.figure(figsize=(5, 5))
+    for i in range(r):
+        plt.scatter(lam_f[i].real, lam_f[i].imag, color=colors[i], label=f"Mode {i+1}")
+    plt.axhline(0, ls='--', color='grey', alpha=0.7)
+    plt.axvline(0, ls='--', color='grey', alpha=0.7)
+    plt.xlabel("Re(λ)")
+    plt.ylabel("Im(λ)")
+    plt.title(f"{sector} – Valeurs propres BOPDMD (100 derniers jours)")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, f"{sector}_bopdmd_eigenvalues.png"))
+    plt.close() 
+
+    # 5) Graphe des modes dynamiques associés (Phi_f)
+    fig, axs = plt.subplots(r, 1, figsize=(8, 2*r), sharex=True)
+    if r == 1: # Gérer le cas où il n'y a qu'un seul mode
+        axs = [axs]
+    for i in range(r):
+       
+        mode_to_plot = Phi_f[:, i].real
+        if np.max(np.abs(mode_to_plot)) > 0:
+            mode_to_plot = mode_to_plot / np.max(np.abs(mode_to_plot))
+        
+        axs[i].bar(tickers, mode_to_plot, color=colors[i])
+        axs[i].set_ylabel(f"Mode {i+1}")
+        axs[i].set_ylim(np.min(Phi_f.real), np.max(Phi_f.real))
+        axs[i].grid(True)
+    axs[-1].set_xticks(range(len(tickers)))
+    axs[-1].set_xticklabels(tickers, rotation=45, ha='right')
+    fig.suptitle(f"{sector} – Modes dynamiques BOPDMD (Re, 100 derniers jours)", fontsize=14)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, f"{sector}_bopdmd_dynamic_modes.png"))
+    plt.close(fig) 
