@@ -1,0 +1,224 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+
+# 1) Discrétisations
+xi = np.linspace(-10, 10, 400)           # grille spatiale
+t  = np.linspace(0, 4*np.pi, 200)        # grille temporelle
+dt = t[1] - t[0]
+Xgrid, T = np.meshgrid(xi, t)
+
+def sech(x):
+    return 1/np.cosh(x)
+
+# 2) Signaux spatio-temporels mixtes
+f1 = sech(Xgrid + 3) * np.exp(1j * 2.3 * T)
+f2 = sech(Xgrid) * np.tanh(Xgrid) * 2 * np.exp(1j * 2.8 * T)
+F  = f1 + f2                              # shape = (nt, nx)
+
+# --- Ajout de bruit gaussien ---
+bruit_amplitude = 0.3  # 20% du max du signal
+np.random.seed(42)
+F_bruit = F + bruit_amplitude  * (
+    np.random.randn(*F.shape) + 1j * np.random.randn(*F.shape)
+)
+
+# 3) Matrice de données X (nx × nt)
+X = F_bruit.T                                   # snapshots en colonnes → (nx=400, nt=200)
+
+# 4) PCA via SVD
+U_pca, S_pca, Vh_pca = np.linalg.svd(X, full_matrices=False)
+pc1_space = U_pca[:,0];  pc2_space = U_pca[:,1]
+time_pc1  = Vh_pca.conj().T[:,0]; time_pc2 = Vh_pca.conj().T[:,1]
+# normalisation à unité max
+pc1_space /= np.max(np.abs(pc1_space))
+pc2_space /= np.max(np.abs(pc2_space))
+time_pc1  /= np.max(np.abs(time_pc1))
+time_pc2  /= np.max(np.abs(time_pc2))
+
+# 5) DMD (rank-2)
+X1, X2 = X[:,:-1], X[:,1:]
+U, S, Vh = np.linalg.svd(X1, full_matrices=False)
+r = 2
+Ur, Sr, Vr = U[:,:r], np.diag(S[:r]), Vh.conj().T[:,:r]
+Atilde     = Ur.conj().T @ X2 @ Vr @ np.linalg.inv(Sr)
+eigvals, W = np.linalg.eig(Atilde)
+Phi        = X2 @ Vr @ np.linalg.inv(Sr) @ W      # (nx×r)
+omega      = np.log(eigvals) / dt     
+print(omega)            # (r,)
+
+# 6) Réordonnancement pour associer ω1=2.3, ω2=2.8
+order = np.argsort(np.imag(omega))
+Phi   = Phi[:, order]
+omega = omega[order]
+
+# 7) Extraction des modes DMD
+dmd_space1 = np.real(Phi[:,0])
+dmd_space2 = np.real(Phi[:,1])
+# normalisation à unité max
+dmd_space1 /= np.max(np.abs(dmd_space1))
+dmd_space2 /= np.max(np.abs(dmd_space2))
+
+dmd_time1 = np.real(np.exp(omega[0]*t))
+dmd_time2 = np.real(np.exp(omega[1]*t))
+# normalisation à unité max
+dmd_time1 /= np.max(np.abs(dmd_time1))
+dmd_time2 /= np.max(np.abs(dmd_time2))
+
+# 8) “Vérité” normalisée
+true_time1  = np.cos(2.3 * t)
+true_time2  = np.cos(2.8 * t)
+true_space1 = sech(xi + 3)
+true_space2 = 2 * sech(xi) * np.tanh(xi)
+# normalisation à unité max
+true_space1 /= np.max(np.abs(true_space1))
+true_space2 /= np.max(np.abs(true_space2))
+
+# ----- Visualisation 3D côte à côte -----
+f1r = np.real(f1)
+f2r = np.real(f2)
+fr_bruit  = np.real(F_bruit)
+
+fig = plt.figure(figsize=(18, 5))
+
+# (a) f1(x, t)
+ax1 = fig.add_subplot(1, 3, 1, projection='3d')
+ax1.plot_surface(Xgrid, T, f1r, cmap='viridis', edgecolor='none', alpha=0.9)
+ax1.set_title('(a) $f_1(x, t) = \\frac{1}{\\cosh(x+3)} e^{i2.3t}$')
+ax1.set_xlabel('x')
+ax1.set_ylabel('t')
+ax1.set_zlabel('Amplitude')
+
+# (b) f2(x, t)
+ax2 = fig.add_subplot(1, 3, 2, projection='3d')
+ax2.plot_surface(Xgrid, T, f2r, cmap='plasma', edgecolor='none', alpha=0.9)
+ax2.set_title('(b) $f_2(x, t) = 2\\frac{\\tanh(x)}{\\cosh(x)}e^{i2.8t}$')
+ax2.set_xlabel('x')
+ax2.set_ylabel('t')
+ax2.set_zlabel('Amplitude')
+
+# (c) f_bruit(x, t)
+ax3 = fig.add_subplot(1, 3, 3, projection='3d')
+ax3.plot_surface(Xgrid, T, fr_bruit, cmap='inferno', edgecolor='none', alpha=0.9)
+ax3.set_title('(c) $f(x, t)$ avec bruit')
+ax3.set_xlabel('x')
+ax3.set_ylabel('t')
+ax3.set_zlabel('Amplitude')
+
+plt.tight_layout()
+plt.show()
+
+# ----- Modes temporels et spatiaux -----
+fig2, axes = plt.subplots(2,2,figsize=(12,7))
+
+# (d) Mode 1 temporel
+axes[0,0].plot(t, true_time1, label='True')
+axes[0,0].plot(t, dmd_time1 , '--', label='DMD')
+axes[0,0].plot(t, time_pc1  , ':', label='PCA')
+axes[0,0].set_title('(d) Mode 1 : Temporel')
+axes[0,0].set_ylim(-1.1, 1.1)
+axes[0,0].legend()
+
+# (e) Mode 2 temporel
+axes[0,1].plot(t, true_time2, label='True')
+axes[0,1].plot(t, dmd_time2 , '--', label='DMD')
+axes[0,1].plot(t, time_pc2  , ':', label='PCA')
+axes[0,1].set_title('(e) Mode 2 : Temporel')
+axes[0,1].set_ylim(-1.1, 1.1)
+axes[0,1].legend()
+
+# (f) Mode 1 spatial
+axes[1,0].plot(xi, true_space1, label='True')
+axes[1,0].plot(xi, dmd_space1 , '--', label='DMD')
+axes[1,0].plot(xi, pc2_space  , ':', label='PCA')
+axes[1,0].set_title('(f) Mode 1 : Spatial')
+axes[1,0].set_ylim(-1.1, 1.1)
+axes[1,0].legend()
+
+# (g) Mode 2 spatial
+axes[1,1].plot(xi, true_space2, label='True')
+axes[1,1].plot(xi, -1*dmd_space2 , '--', label='DMD')
+axes[1,1].plot(xi, -1*pc1_space  , ':', label='PCA')
+axes[1,1].set_title('(g) Mode 2 : Spatial')
+axes[1,1].set_ylim(-1.1, 1.1)
+axes[1,1].legend()
+
+axes[1,0].set_xlabel('x')
+axes[1,1].set_xlabel('x')
+axes[0,0].set_ylabel('Amplitude')
+axes[1,0].set_ylabel('Amplitude')
+plt.tight_layout()
+plt.show()
+
+import numpy as np
+import matplotlib.pyplot as plt
+from pydmd import OptDMD
+
+
+# Paramètres
+dt = t[1] - t[0]
+r = 2  # rang
+
+# Application de OptDMD (Variable Projection)
+dmd = OptDMD(svd_rank=r)
+dmd.fit(X, t)  # X: shape (nx, nt) / t: shape (nt,)
+
+# Modes et fréquences extraits
+opt_dmd_modes = dmd.modes  # (nx, r)
+opt_dmd_eigs  = dmd.eigs   # (r,)
+opt_dmd_omega = np.log(opt_dmd_eigs) / dt  # Fréquences continues
+
+# Dynamiques temporelles reconstituées
+opt_dmd_dynamics = dmd.dynamics  # shape: (r, nt)
+
+# ----------- Comparaison avec la vérité (exemple pour Mode 1) -----------
+
+# Modes spatiaux
+mode1_space = np.real(opt_dmd_modes[:,0])
+mode2_space = np.real(opt_dmd_modes[:,1])
+mode1_space /= np.max(np.abs(mode1_space))
+mode2_space /= np.max(np.abs(mode2_space))
+
+# Dynamiques temporelles (amplitude)
+mode1_time = np.real(opt_dmd_dynamics[0,:])
+mode2_time = np.real(opt_dmd_dynamics[1,:])
+mode1_time /= np.max(np.abs(mode1_time))
+mode2_time /= np.max(np.abs(mode2_time))
+
+# Affichage
+fig, axes = plt.subplots(2,2,figsize=(12,7))
+
+# (1) Mode 1 temporel
+axes[0,0].plot(t, true_time1, label='True')
+axes[0,0].plot(t, mode1_time, '--', label='OptDMD')
+axes[0,0].set_title('OptDMD - Mode 1 : Temporel')
+axes[0,0].set_ylim(-1.1, 1.1)
+axes[0,0].legend()
+
+# (2) Mode 2 temporel
+axes[0,1].plot(t, true_time2, label='True')
+axes[0,1].plot(t, mode2_time, '--', label='OptDMD')
+axes[0,1].set_title('OptDMD - Mode 2 : Temporel')
+axes[0,1].set_ylim(-1.1, 1.1)
+axes[0,1].legend()
+
+# (3) Mode 1 spatial
+axes[1,0].plot(xi, true_space1, label='True')
+axes[1,0].plot(xi, mode1_space, '--', label='OptDMD')
+axes[1,0].set_title('OptDMD - Mode 1 : Spatial')
+axes[1,0].set_ylim(-1.1, 1.1)
+axes[1,0].legend()
+
+# (4) Mode 2 spatial
+axes[1,1].plot(xi, true_space2, label='True')
+axes[1,1].plot(xi, mode2_space, '--', label='OptDMD')
+axes[1,1].set_title('OptDMD - Mode 2 : Spatial')
+axes[1,1].set_ylim(-1.1, 1.1)
+axes[1,1].legend()
+
+axes[1,0].set_xlabel('x')
+axes[1,1].set_xlabel('x')
+axes[0,0].set_ylabel('Amplitude')
+axes[1,0].set_ylabel('Amplitude')
+plt.tight_layout()
+plt.show()
